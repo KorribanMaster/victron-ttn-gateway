@@ -168,11 +168,11 @@ pub async fn display_task(
 
         // Draw text with baseline at top (so Y coordinate is the top of the text)
         debug!("Drawing text to display buffer");
-        Text::with_baseline(&line1_buffer, Point::new(0, 16), text_style)
+        Text::with_baseline(&line1_buffer, Point::new(0, 16), text_style, Baseline::Top)
             .draw(&mut display)
             .ok();
 
-        Text::with_baseline(&line2_buffer, Point::new(0, 48), text_style)
+        Text::with_baseline(&line2_buffer, Point::new(0, 48), text_style, Baseline::Top)
             .draw(&mut display)
             .ok();
 
