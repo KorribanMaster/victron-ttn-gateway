@@ -3,17 +3,18 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use influxdb2::models::DataPoint;
 use influxdb2::Client;
-use reqwest;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
-// TTN API Response structures
+// TTN API response structures — only the fields we actually consume.
 #[derive(Debug, Deserialize)]
 struct TtnMessage {
     result: UplinkResult,
@@ -29,20 +30,12 @@ struct UplinkResult {
 #[derive(Debug, Deserialize)]
 struct EndDeviceIds {
     device_id: String,
-    #[serde(default)]
-    dev_eui: Option<String>,
-    #[serde(default)]
-    dev_addr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UplinkMessage {
     #[serde(default)]
-    f_port: Option<u8>,
-    #[serde(default)]
     f_cnt: Option<u32>,
-    #[serde(default)]
-    frm_payload: Option<String>,
     #[serde(default)]
     decoded_payload: Option<serde_json::Value>,
     #[serde(default)]
@@ -57,24 +50,18 @@ struct RxMetadata {
     #[serde(default)]
     rssi: Option<i32>,
     #[serde(default)]
-    channel_rssi: Option<i32>,
-    #[serde(default)]
     snr: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GatewayIds {
     gateway_id: String,
-    #[serde(default)]
-    eui: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Settings {
     #[serde(default)]
     data_rate: Option<DataRate>,
-    #[serde(default)]
-    frequency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,8 +76,481 @@ struct LoRaSettings {
     bandwidth: Option<u32>,
     #[serde(default)]
     spreading_factor: Option<u8>,
-    #[serde(default)]
-    coding_rate: Option<String>,
+}
+
+// Device dispatch table. Adding a new Victron device is a one-entry change.
+#[derive(Clone, Copy)]
+enum FieldType {
+    F64,
+    I64,
+}
+
+struct FieldMap {
+    json_key: &'static str,
+    influx_field: &'static str,
+    ty: FieldType,
+}
+
+struct DeviceSpec {
+    device_type: &'static str,
+    measurement: &'static str,
+    fields: &'static [FieldMap],
+}
+
+const DEVICE_SPECS: &[DeviceSpec] = &[
+    DeviceSpec {
+        device_type: "BatteryMonitor",
+        measurement: "battery_monitor",
+        fields: &[
+            FieldMap {
+                json_key: "voltage",
+                influx_field: "voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "current",
+                influx_field: "current",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "soc",
+                influx_field: "soc",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "consumed_ah",
+                influx_field: "consumed_ah",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "rssi",
+                influx_field: "device_rssi",
+                ty: FieldType::I64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "SolarCharger",
+        measurement: "solar_charger",
+        fields: &[
+            FieldMap {
+                json_key: "battery_voltage",
+                influx_field: "battery_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "battery_current",
+                influx_field: "battery_current",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "pv_power",
+                influx_field: "pv_power",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "yield_today",
+                influx_field: "yield_today",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "rssi",
+                influx_field: "device_rssi",
+                ty: FieldType::I64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "DcDcConverter",
+        measurement: "dc_dc_converter",
+        fields: &[
+            FieldMap {
+                json_key: "input_voltage",
+                influx_field: "input_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_voltage",
+                influx_field: "output_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "off_reason",
+                influx_field: "off_reason",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "rssi",
+                influx_field: "device_rssi",
+                ty: FieldType::I64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "AcCharger",
+        measurement: "ac_charger",
+        fields: &[
+            FieldMap {
+                json_key: "output_voltage1",
+                influx_field: "output_voltage1",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_current1",
+                influx_field: "output_current1",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_voltage2",
+                influx_field: "output_voltage2",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_current2",
+                influx_field: "output_current2",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_voltage3",
+                influx_field: "output_voltage3",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_current3",
+                influx_field: "output_current3",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "temperature",
+                influx_field: "temperature",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "ac_current",
+                influx_field: "ac_current",
+                ty: FieldType::F64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "BatterySense",
+        measurement: "battery_sense",
+        fields: &[
+            FieldMap {
+                json_key: "voltage",
+                influx_field: "voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "temperature",
+                influx_field: "temperature",
+                ty: FieldType::F64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "DcEnergyMeter",
+        measurement: "dc_energy_meter",
+        fields: &[
+            FieldMap {
+                json_key: "voltage",
+                influx_field: "voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "current",
+                influx_field: "current",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "power",
+                influx_field: "power",
+                ty: FieldType::I64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "Inverter",
+        measurement: "inverter",
+        fields: &[
+            FieldMap {
+                json_key: "battery_voltage",
+                influx_field: "battery_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "ac_apparent_power",
+                influx_field: "ac_apparent_power",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "ac_voltage",
+                influx_field: "ac_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "ac_current",
+                influx_field: "ac_current",
+                ty: FieldType::F64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "LynxSmartBMS",
+        measurement: "lynx_smart_bms",
+        fields: &[
+            FieldMap {
+                json_key: "voltage",
+                influx_field: "voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "current",
+                influx_field: "current",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "soc",
+                influx_field: "soc",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "consumed_ah",
+                influx_field: "consumed_ah",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "temperature",
+                influx_field: "temperature",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "battery_temperature",
+                influx_field: "battery_temperature",
+                ty: FieldType::F64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "OrionXS",
+        measurement: "orion_xs",
+        fields: &[
+            FieldMap {
+                json_key: "input_voltage",
+                influx_field: "input_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "input_current",
+                influx_field: "input_current",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_voltage",
+                influx_field: "output_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_current",
+                influx_field: "output_current",
+                ty: FieldType::F64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "SmartBatteryProtect",
+        measurement: "smart_battery_protect",
+        fields: &[
+            FieldMap {
+                json_key: "input_voltage",
+                influx_field: "input_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "output_voltage",
+                influx_field: "output_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "error_code",
+                influx_field: "error_code",
+                ty: FieldType::I64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "SmartLithium",
+        measurement: "smart_lithium",
+        fields: &[
+            FieldMap {
+                json_key: "battery_voltage",
+                influx_field: "battery_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "cell_count",
+                influx_field: "cell_count",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "temperature",
+                influx_field: "temperature",
+                ty: FieldType::F64,
+            },
+        ],
+    },
+    DeviceSpec {
+        device_type: "VEBus",
+        measurement: "vebus",
+        fields: &[
+            FieldMap {
+                json_key: "battery_voltage",
+                influx_field: "battery_voltage",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "battery_current",
+                influx_field: "battery_current",
+                ty: FieldType::F64,
+            },
+            FieldMap {
+                json_key: "soc",
+                influx_field: "soc",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "ac_in_power",
+                influx_field: "ac_in_power",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "ac_out_power",
+                influx_field: "ac_out_power",
+                ty: FieldType::I64,
+            },
+            FieldMap {
+                json_key: "battery_temperature",
+                influx_field: "battery_temperature",
+                ty: FieldType::I64,
+            },
+        ],
+    },
+];
+
+fn build_device_point(
+    device_id: &str,
+    decoded: &serde_json::Value,
+    timestamp: DateTime<Utc>,
+) -> Result<Option<DataPoint>> {
+    let device_type = decoded
+        .get("device_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let ts_nanos = timestamp.timestamp_nanos_opt().unwrap_or(0);
+
+    if let Some(spec) = DEVICE_SPECS.iter().find(|s| s.device_type == device_type) {
+        let mut builder = DataPoint::builder(spec.measurement)
+            .tag("device_id", device_id)
+            .timestamp(ts_nanos);
+        let mut has_any_field = false;
+        for fm in spec.fields {
+            let Some(v) = decoded.get(fm.json_key) else {
+                continue;
+            };
+            match fm.ty {
+                FieldType::F64 => {
+                    if let Some(n) = v.as_f64() {
+                        builder = builder.field(fm.influx_field, n);
+                        has_any_field = true;
+                    }
+                }
+                FieldType::I64 => {
+                    if let Some(n) = v.as_i64() {
+                        builder = builder.field(fm.influx_field, n);
+                        has_any_field = true;
+                    }
+                }
+            }
+        }
+        if !has_any_field {
+            return Ok(None);
+        }
+        Ok(Some(builder.build()?))
+    } else {
+        warn!("Unknown device type: {}", device_type);
+        Ok(Some(
+            DataPoint::builder("unknown_device")
+                .tag("device_id", device_id)
+                .tag("device_type", device_type)
+                .field("raw_json", decoded.to_string())
+                .timestamp(ts_nanos)
+                .build()?,
+        ))
+    }
+}
+
+// Persistent cursor of the most recent `received_at` we have processed.
+// Used to ask TTN for `after=<ts>` on reconnect instead of re-fetching
+// the trailing 24 hours every time.
+#[derive(Clone)]
+struct Cursor {
+    last_received_at: Arc<Mutex<Option<DateTime<Utc>>>>,
+    path: Arc<PathBuf>,
+}
+
+impl Cursor {
+    fn load(path: PathBuf) -> Self {
+        let last = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        match &last {
+            Some(dt) => info!("Loaded cursor from {:?}: {}", path, dt),
+            None => info!(
+                "No cursor at {:?}; first connect will request last=24h",
+                path
+            ),
+        }
+        Self {
+            last_received_at: Arc::new(Mutex::new(last)),
+            path: Arc::new(path),
+        }
+    }
+
+    fn get(&self) -> Option<DateTime<Utc>> {
+        self.last_received_at.lock().ok().and_then(|g| *g)
+    }
+
+    fn update(&self, ts: DateTime<Utc>) {
+        let should_persist = {
+            let Ok(mut guard) = self.last_received_at.lock() else {
+                return;
+            };
+            match *guard {
+                Some(current) if ts <= current => false,
+                _ => {
+                    *guard = Some(ts);
+                    true
+                }
+            }
+        };
+        if !should_persist {
+            return;
+        }
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let tmp = self.path.with_extension("tmp");
+        if let Err(e) = fs::write(&tmp, ts.to_rfc3339()) {
+            warn!("Failed to write cursor tmp file: {:?}", e);
+            return;
+        }
+        if let Err(e) = fs::rename(&tmp, &*self.path) {
+            warn!("Failed to rename cursor tmp file: {:?}", e);
+        }
+    }
 }
 
 // Health tracking structure
@@ -125,7 +585,6 @@ impl HealthStatus {
 
     fn is_healthy(&self) -> bool {
         if let Ok(last_time) = self.last_message_time.read() {
-            // Consider unhealthy if no message in 5 minutes
             last_time.elapsed() < Duration::from_secs(300)
         } else {
             false
@@ -138,9 +597,13 @@ impl HealthStatus {
         } else {
             0
         };
-
         HealthResponse {
-            status: if self.is_healthy() { "healthy" } else { "unhealthy" }.to_string(),
+            status: if self.is_healthy() {
+                "healthy"
+            } else {
+                "unhealthy"
+            }
+            .to_string(),
             last_message_ago_secs: last_message_ago,
             messages_processed: self.messages_processed.load(Ordering::Relaxed),
             reconnect_count: self.reconnect_count.load(Ordering::Relaxed),
@@ -165,18 +628,27 @@ struct TtnIngestor {
     ttn_region: String,
     bucket: String,
     health_status: HealthStatus,
+    cursor: Cursor,
+    stream_connected_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl TtnIngestor {
     fn new() -> Result<Self> {
-        let influx_url = env::var("INFLUXDB_URL").unwrap_or_else(|_| "http://localhost:8086".to_string());
+        let influx_url =
+            env::var("INFLUXDB_URL").unwrap_or_else(|_| "http://localhost:8086".to_string());
         let influx_token = env::var("INFLUXDB_TOKEN").context("INFLUXDB_TOKEN not set")?;
-        let influx_org = env::var("INFLUXDB_ORG").unwrap_or_else(|_| "victron-monitoring".to_string());
+        let influx_org =
+            env::var("INFLUXDB_ORG").unwrap_or_else(|_| "victron-monitoring".to_string());
         let bucket = env::var("INFLUXDB_BUCKET").unwrap_or_else(|_| "victron-data".to_string());
 
         let ttn_app_id = env::var("TTN_APP_ID").unwrap_or_else(|_| "vanman".to_string());
         let ttn_api_key = env::var("TTN_API_KEY").context("TTN_API_KEY not set")?;
         let ttn_region = env::var("TTN_REGION").unwrap_or_else(|_| "eu1".to_string());
+
+        let cursor_path = env::var("TTN_CURSOR_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/var/lib/ttn-ingest/cursor"));
+        let cursor = Cursor::load(cursor_path);
 
         let influx_client = Client::new(&influx_url, &influx_org, &influx_token);
 
@@ -192,11 +664,13 @@ impl TtnIngestor {
             ttn_region,
             bucket,
             health_status: HealthStatus::new(),
+            cursor,
+            stream_connected_at: Arc::new(Mutex::new(None)),
         })
     }
 
     async fn process_uplink(&self, message: TtnMessage) -> Result<()> {
-        let device_id = &message.result.end_device_ids.device_id;
+        let device_id = message.result.end_device_ids.device_id.clone();
         let timestamp = DateTime::parse_from_rfc3339(&message.result.received_at)
             .context("Failed to parse timestamp")?
             .with_timezone(&Utc);
@@ -204,394 +678,66 @@ impl TtnIngestor {
         debug!("Processing uplink from {}", device_id);
 
         let uplink = &message.result.uplink_message;
+        let ts_nanos = timestamp.timestamp_nanos_opt().unwrap_or(0);
+        let mut points: Vec<DataPoint> = Vec::new();
 
-        // Write signal quality metrics from each gateway
-        for rx_meta in &uplink.rx_metadata {
-            if let (Some(rssi), Some(snr)) = (rx_meta.rssi, rx_meta.snr) {
-                let point = DataPoint::builder("signal_quality")
-                    .tag("device_id", device_id)
-                    .tag("gateway_id", &rx_meta.gateway_ids.gateway_id)
-                    .field("rssi", rssi as i64)
-                    .field("snr", snr)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0))
-                    .build()?;
-
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { point }))
-                    .await
-                    .context("Failed to write signal quality")?;
+        for rx in &uplink.rx_metadata {
+            if let (Some(rssi), Some(snr)) = (rx.rssi, rx.snr) {
+                points.push(
+                    DataPoint::builder("signal_quality")
+                        .tag("device_id", &device_id)
+                        .tag("gateway_id", &rx.gateway_ids.gateway_id)
+                        .field("rssi", rssi as i64)
+                        .field("snr", snr)
+                        .timestamp(ts_nanos)
+                        .build()?,
+                );
             }
         }
 
-        // Write network settings
-        if let Some(settings) = &uplink.settings {
-            if let Some(data_rate) = &settings.data_rate {
-                if let Some(lora) = &data_rate.lora {
-                    let mut point_builder = DataPoint::builder("network_info")
-                        .tag("device_id", device_id)
-                        .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                    if let Some(sf) = lora.spreading_factor {
-                        point_builder = point_builder.field("spreading_factor", sf as i64);
-                    }
-                    if let Some(bw) = lora.bandwidth {
-                        point_builder = point_builder.field("bandwidth", bw as i64);
-                    }
-
-                    let point = point_builder.build()?;
-                    self.influx_client
-                        .write(&self.bucket, futures::stream::once(async { point }))
-                        .await
-                        .context("Failed to write network info")?;
-                }
+        let mut info_builder = DataPoint::builder("network_info")
+            .tag("device_id", &device_id)
+            .timestamp(ts_nanos);
+        let mut info_has_fields = false;
+        if let Some(f_cnt) = uplink.f_cnt {
+            info_builder = info_builder.field("f_cnt", f_cnt as i64);
+            info_has_fields = true;
+        }
+        if let Some(lora) = uplink
+            .settings
+            .as_ref()
+            .and_then(|s| s.data_rate.as_ref())
+            .and_then(|dr| dr.lora.as_ref())
+        {
+            if let Some(sf) = lora.spreading_factor {
+                info_builder = info_builder.field("spreading_factor", sf as i64);
+                info_has_fields = true;
+            }
+            if let Some(bw) = lora.bandwidth {
+                info_builder = info_builder.field("bandwidth", bw as i64);
+                info_has_fields = true;
             }
         }
+        if info_has_fields {
+            points.push(info_builder.build()?);
+        }
 
-        // Write decoded device data
         if let Some(decoded) = &uplink.decoded_payload {
-            self.write_device_data(device_id, decoded, timestamp).await?;
+            if let Some(p) = build_device_point(&device_id, decoded, timestamp)? {
+                points.push(p);
+            }
+        }
+
+        if !points.is_empty() {
+            self.influx_client
+                .write(&self.bucket, futures::stream::iter(points))
+                .await
+                .context("Failed to write points to InfluxDB")?;
         }
 
         info!("✓ Processed uplink from {}", device_id);
         self.health_status.update_message_received();
-        Ok(())
-    }
-
-    async fn write_device_data(
-        &self,
-        device_id: &str,
-        decoded: &serde_json::Value,
-        timestamp: DateTime<Utc>,
-    ) -> Result<()> {
-        let device_type = decoded
-            .get("device_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        debug!("Device type: {}", device_type);
-
-        match device_type {
-            "BatteryMonitor" => {
-                let mut point = DataPoint::builder("battery_monitor")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                // Add fields based on decoded payload
-                if let Some(voltage) = decoded.get("voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("voltage", voltage);
-                }
-                if let Some(current) = decoded.get("current").and_then(|v| v.as_f64()) {
-                    point = point.field("current", current);
-                }
-                if let Some(soc) = decoded.get("soc").and_then(|v| v.as_f64()) {
-                    point = point.field("soc", soc);
-                }
-                if let Some(consumed_ah) = decoded.get("consumed_ah").and_then(|v| v.as_f64()) {
-                    point = point.field("consumed_ah", consumed_ah);
-                }
-                if let Some(rssi) = decoded.get("rssi").and_then(|v| v.as_i64()) {
-                    point = point.field("device_rssi", rssi);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write battery monitor data")?;
-            }
-            "SolarCharger" => {
-                let mut point = DataPoint::builder("solar_charger")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(battery_voltage) = decoded.get("battery_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("battery_voltage", battery_voltage);
-                }
-                if let Some(battery_current) = decoded.get("battery_current").and_then(|v| v.as_f64()) {
-                    point = point.field("battery_current", battery_current);
-                }
-                if let Some(pv_power) = decoded.get("pv_power").and_then(|v| v.as_i64()) {
-                    point = point.field("pv_power", pv_power);
-                }
-                if let Some(yield_today) = decoded.get("yield_today").and_then(|v| v.as_i64()) {
-                    point = point.field("yield_today", yield_today);
-                }
-                if let Some(rssi) = decoded.get("rssi").and_then(|v| v.as_i64()) {
-                    point = point.field("device_rssi", rssi);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write solar charger data")?;
-            }
-            "DcDcConverter" => {
-                let mut point = DataPoint::builder("dc_dc_converter")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(input_voltage) = decoded.get("input_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("input_voltage", input_voltage);
-                }
-                if let Some(output_voltage) = decoded.get("output_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("output_voltage", output_voltage);
-                }
-                if let Some(off_reason) = decoded.get("off_reason").and_then(|v| v.as_i64()) {
-                    point = point.field("off_reason", off_reason);
-                }
-                if let Some(rssi) = decoded.get("rssi").and_then(|v| v.as_i64()) {
-                    point = point.field("device_rssi", rssi);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write DC-DC converter data")?;
-            }
-            "AcCharger" => {
-                let mut point = DataPoint::builder("ac_charger")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(output_voltage1) = decoded.get("output_voltage1").and_then(|v| v.as_f64()) {
-                    point = point.field("output_voltage1", output_voltage1);
-                }
-                if let Some(output_current1) = decoded.get("output_current1").and_then(|v| v.as_f64()) {
-                    point = point.field("output_current1", output_current1);
-                }
-                if let Some(output_voltage2) = decoded.get("output_voltage2").and_then(|v| v.as_f64()) {
-                    point = point.field("output_voltage2", output_voltage2);
-                }
-                if let Some(output_current2) = decoded.get("output_current2").and_then(|v| v.as_f64()) {
-                    point = point.field("output_current2", output_current2);
-                }
-                if let Some(output_voltage3) = decoded.get("output_voltage3").and_then(|v| v.as_f64()) {
-                    point = point.field("output_voltage3", output_voltage3);
-                }
-                if let Some(output_current3) = decoded.get("output_current3").and_then(|v| v.as_f64()) {
-                    point = point.field("output_current3", output_current3);
-                }
-                if let Some(temperature) = decoded.get("temperature").and_then(|v| v.as_i64()) {
-                    point = point.field("temperature", temperature);
-                }
-                if let Some(ac_current) = decoded.get("ac_current").and_then(|v| v.as_f64()) {
-                    point = point.field("ac_current", ac_current);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write AC charger data")?;
-            }
-            "BatterySense" => {
-                let mut point = DataPoint::builder("battery_sense")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(voltage) = decoded.get("voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("voltage", voltage);
-                }
-                if let Some(temperature) = decoded.get("temperature").and_then(|v| v.as_f64()) {
-                    point = point.field("temperature", temperature);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write battery sense data")?;
-            }
-            "DcEnergyMeter" => {
-                let mut point = DataPoint::builder("dc_energy_meter")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(voltage) = decoded.get("voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("voltage", voltage);
-                }
-                if let Some(current) = decoded.get("current").and_then(|v| v.as_f64()) {
-                    point = point.field("current", current);
-                }
-                if let Some(power) = decoded.get("power").and_then(|v| v.as_i64()) {
-                    point = point.field("power", power);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write DC energy meter data")?;
-            }
-            "Inverter" => {
-                let mut point = DataPoint::builder("inverter")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(battery_voltage) = decoded.get("battery_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("battery_voltage", battery_voltage);
-                }
-                if let Some(ac_apparent_power) = decoded.get("ac_apparent_power").and_then(|v| v.as_i64()) {
-                    point = point.field("ac_apparent_power", ac_apparent_power);
-                }
-                if let Some(ac_voltage) = decoded.get("ac_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("ac_voltage", ac_voltage);
-                }
-                if let Some(ac_current) = decoded.get("ac_current").and_then(|v| v.as_f64()) {
-                    point = point.field("ac_current", ac_current);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write inverter data")?;
-            }
-            "LynxSmartBMS" => {
-                let mut point = DataPoint::builder("lynx_smart_bms")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(voltage) = decoded.get("voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("voltage", voltage);
-                }
-                if let Some(current) = decoded.get("current").and_then(|v| v.as_f64()) {
-                    point = point.field("current", current);
-                }
-                if let Some(soc) = decoded.get("soc").and_then(|v| v.as_f64()) {
-                    point = point.field("soc", soc);
-                }
-                if let Some(consumed_ah) = decoded.get("consumed_ah").and_then(|v| v.as_f64()) {
-                    point = point.field("consumed_ah", consumed_ah);
-                }
-                if let Some(temperature) = decoded.get("temperature").and_then(|v| v.as_f64()) {
-                    point = point.field("temperature", temperature);
-                }
-                if let Some(battery_temperature) = decoded.get("battery_temperature").and_then(|v| v.as_f64()) {
-                    point = point.field("battery_temperature", battery_temperature);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write Lynx Smart BMS data")?;
-            }
-            "OrionXS" => {
-                let mut point = DataPoint::builder("orion_xs")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(input_voltage) = decoded.get("input_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("input_voltage", input_voltage);
-                }
-                if let Some(input_current) = decoded.get("input_current").and_then(|v| v.as_f64()) {
-                    point = point.field("input_current", input_current);
-                }
-                if let Some(output_voltage) = decoded.get("output_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("output_voltage", output_voltage);
-                }
-                if let Some(output_current) = decoded.get("output_current").and_then(|v| v.as_f64()) {
-                    point = point.field("output_current", output_current);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write Orion XS data")?;
-            }
-            "SmartBatteryProtect" => {
-                let mut point = DataPoint::builder("smart_battery_protect")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(input_voltage) = decoded.get("input_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("input_voltage", input_voltage);
-                }
-                if let Some(output_voltage) = decoded.get("output_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("output_voltage", output_voltage);
-                }
-                if let Some(error_code) = decoded.get("error_code").and_then(|v| v.as_i64()) {
-                    point = point.field("error_code", error_code);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write Smart Battery Protect data")?;
-            }
-            "SmartLithium" => {
-                let mut point = DataPoint::builder("smart_lithium")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(battery_voltage) = decoded.get("battery_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("battery_voltage", battery_voltage);
-                }
-                if let Some(cell_count) = decoded.get("cell_count").and_then(|v| v.as_i64()) {
-                    point = point.field("cell_count", cell_count);
-                }
-                if let Some(temperature) = decoded.get("temperature").and_then(|v| v.as_f64()) {
-                    point = point.field("temperature", temperature);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write Smart Lithium data")?;
-            }
-            "VEBus" => {
-                let mut point = DataPoint::builder("vebus")
-                    .tag("device_id", device_id)
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0));
-
-                if let Some(battery_voltage) = decoded.get("battery_voltage").and_then(|v| v.as_f64()) {
-                    point = point.field("battery_voltage", battery_voltage);
-                }
-                if let Some(battery_current) = decoded.get("battery_current").and_then(|v| v.as_f64()) {
-                    point = point.field("battery_current", battery_current);
-                }
-                if let Some(soc) = decoded.get("soc").and_then(|v| v.as_i64()) {
-                    point = point.field("soc", soc);
-                }
-                if let Some(ac_in_power) = decoded.get("ac_in_power").and_then(|v| v.as_i64()) {
-                    point = point.field("ac_in_power", ac_in_power);
-                }
-                if let Some(ac_out_power) = decoded.get("ac_out_power").and_then(|v| v.as_i64()) {
-                    point = point.field("ac_out_power", ac_out_power);
-                }
-                if let Some(battery_temperature) = decoded.get("battery_temperature").and_then(|v| v.as_i64()) {
-                    point = point.field("battery_temperature", battery_temperature);
-                }
-
-                let data_point = point.build()?;
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { data_point }))
-                    .await
-                    .context("Failed to write VE.Bus data")?;
-            }
-            _ => {
-                // Store as generic device data
-                warn!("Unknown device type: {}", device_type);
-                let point = DataPoint::builder("unknown_device")
-                    .tag("device_id", device_id)
-                    .tag("device_type", device_type)
-                    .field("raw_json", decoded.to_string())
-                    .timestamp(timestamp.timestamp_nanos_opt().unwrap_or(0))
-                    .build()?;
-
-                self.influx_client
-                    .write(&self.bucket, futures::stream::once(async { point }))
-                    .await
-                    .context("Failed to write unknown device data")?;
-            }
-        }
-
+        self.cursor.update(timestamp);
         Ok(())
     }
 
@@ -601,11 +747,37 @@ impl TtnIngestor {
             self.ttn_region, self.ttn_app_id
         );
 
-        info!("Connecting to TTN: {}", url);
+        let mut query: Vec<(&str, String)> = Vec::new();
+        match self.cursor.get() {
+            Some(ts) => {
+                let after = ts.to_rfc3339();
+                info!("Connecting to TTN: {} (after={})", url, after);
+                query.push(("after", after));
+            }
+            None => {
+                info!("Connecting to TTN: {} (last=24h)", url);
+                query.push(("last", "24h".to_string()));
+            }
+        }
+        // Ask TTN to only send the uplink_message fields we consume. Paths
+        // are rooted at `up` in the storage integration's gRPC schema
+        // (which is `result` in the JSON envelope). TTN expects a single
+        // comma-separated value, and end_device_ids/received_at are always
+        // included and rejected from the mask.
+        query.push((
+            "field_mask",
+            [
+                "up.uplink_message.f_cnt",
+                "up.uplink_message.decoded_payload",
+                "up.uplink_message.rx_metadata",
+                "up.uplink_message.settings",
+            ]
+            .join(","),
+        ));
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(0) // Disable connection pooling to prevent stale connections
+            .pool_max_idle_per_host(0)
             .pool_idle_timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(10))
             .build()?;
@@ -614,18 +786,24 @@ impl TtnIngestor {
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.ttn_api_key))
             .header("Accept", "text/event-stream")
-            .query(&[("last", "24h")]) // Get last 24h on startup
+            .query(&query)
             .send()
             .await
             .context("Failed to connect to TTN")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
             anyhow::bail!("TTN API returned status {}: {}", status, body);
         }
 
         info!("Connected to TTN stream");
+        if let Ok(mut g) = self.stream_connected_at.lock() {
+            *g = Some(Instant::now());
+        }
 
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
@@ -636,7 +814,6 @@ impl TtnIngestor {
                     let text = String::from_utf8_lossy(&bytes);
                     buffer.push_str(&text);
 
-                    // Process complete lines
                     while let Some(newline_pos) = buffer.find('\n') {
                         let line = buffer[..newline_pos].trim().to_string();
                         buffer = buffer[newline_pos + 1..].to_string();
@@ -645,7 +822,6 @@ impl TtnIngestor {
                             continue;
                         }
 
-                        // SSE format can have "data: " prefix or just JSON
                         let json_str = if line.starts_with("data:") {
                             line.strip_prefix("data:").unwrap_or(&line).trim()
                         } else {
@@ -656,7 +832,6 @@ impl TtnIngestor {
                             continue;
                         }
 
-                        // Try to parse as TtnMessage
                         match serde_json::from_str::<TtnMessage>(json_str) {
                             Ok(message) => {
                                 let device_id = message.result.end_device_ids.device_id.clone();
@@ -665,9 +840,12 @@ impl TtnIngestor {
                                 }
                             }
                             Err(e) => {
-                                // Only log if it's not a keep-alive or comment
                                 if !json_str.starts_with(':') {
-                                    debug!("Failed to parse JSON (might be keep-alive): {:?}, raw: {}", e, json_str.chars().take(100).collect::<String>());
+                                    debug!(
+                                        "Failed to parse JSON (might be keep-alive): {:?}, raw: {}",
+                                        e,
+                                        json_str.chars().take(100).collect::<String>()
+                                    );
                                 }
                             }
                         }
@@ -685,21 +863,44 @@ impl TtnIngestor {
     }
 
     async fn run(&self) -> Result<()> {
-        let mut reconnect_count: u64 = 0;
+        let mut attempt: u32 = 0;
         loop {
             match self.stream_uplinks().await {
-                Ok(_) => {
-                    warn!("Stream ended normally, reconnecting...");
-                    reconnect_count = 0; // Reset on successful disconnect
-                }
+                Ok(_) => warn!("Stream ended normally, reconnecting..."),
                 Err(e) => {
-                    reconnect_count += 1;
                     self.health_status.update_reconnect();
-                    error!("Stream error (attempt {}): {:?}, reconnecting in 5s...", reconnect_count, e);
+                    error!("Stream error (attempt {}): {:?}", attempt + 1, e);
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // If the stream stayed connected long enough to count as a
+            // successful session, reset the backoff counter.
+            let stayed_connected = self
+                .stream_connected_at
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map(|t| t.elapsed() >= Duration::from_secs(60))
+                .unwrap_or(false);
+            if let Ok(mut g) = self.stream_connected_at.lock() {
+                *g = None;
+            }
+            if stayed_connected {
+                attempt = 0;
+            } else {
+                attempt = attempt.saturating_add(1);
+            }
+
+            // Exponential backoff: 2s, 4s, 8s, ... capped at 300s, plus up to 1s jitter.
+            let exp = attempt.saturating_sub(1).min(8); // 2^8 = 256
+            let delay_secs = (2u64.saturating_mul(1u64 << exp)).min(300);
+            let jitter_millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| (d.subsec_nanos() % 1000) as u64)
+                .unwrap_or(0);
+            let total = Duration::from_secs(delay_secs) + Duration::from_millis(jitter_millis);
+            warn!("Reconnecting in {:?} (next attempt {})", total, attempt + 1);
+            tokio::time::sleep(total).await;
         }
     }
 }
@@ -725,23 +926,25 @@ async fn run_health_server(health_status: HealthStatus) {
                     if let Ok(n) = socket.read(&mut buffer).await {
                         if n > 0 {
                             let request = String::from_utf8_lossy(&buffer[..n]);
-
-                            // Simple HTTP request parsing
                             if request.contains("GET /health") {
                                 let status = health.get_status();
-                                let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
-                                let http_status = if health.is_healthy() { "200 OK" } else { "503 Service Unavailable" };
-
+                                let json = serde_json::to_string(&status)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                let http_status = if health.is_healthy() {
+                                    "200 OK"
+                                } else {
+                                    "503 Service Unavailable"
+                                };
                                 let response = format!(
                                     "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                                     http_status,
                                     json.len(),
                                     json
                                 );
-
                                 let _ = socket.write_all(response.as_bytes()).await;
                             } else {
-                                let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+                                let response =
+                                    "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
                                 let _ = socket.write_all(response.as_bytes()).await;
                             }
                         }
@@ -757,7 +960,6 @@ async fn run_health_server(health_status: HealthStatus) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -769,7 +971,6 @@ async fn main() -> Result<()> {
 
     let ingestor = TtnIngestor::new()?;
 
-    // Spawn health server in background
     let health_status = ingestor.health_status.clone();
     tokio::spawn(async move {
         run_health_server(health_status).await;
