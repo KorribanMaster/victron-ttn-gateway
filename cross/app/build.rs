@@ -78,7 +78,7 @@ fn generate_victron_encryption_keys(out: &PathBuf) {
     writeln!(
         &mut file,
         "pub const ENCRYPTION_KEYS: [[u8; 16]; {}] = [",
-        keys.len() // At least 1 key (example key if none provided)
+        keys.len().max(1) // At least 1 key (example key if none provided)
     )
     .unwrap();
 
