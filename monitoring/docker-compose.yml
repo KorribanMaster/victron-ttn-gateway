@@ -54,6 +54,8 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    volumes:
+      - ttn-ingest-state:/var/lib/ttn-ingest
     environment:
       - TTN_APP_ID=${TTN_APP_ID:-vanman}
       - TTN_API_KEY=${TTN_API_KEY}
@@ -79,6 +81,7 @@ volumes:
   influxdb-data:
   influxdb-config:
   grafana-data:
+  ttn-ingest-state:
 
 networks:
   victron-net:

@@ -28,6 +28,10 @@ RUN apt-get update && apt-get install -y \
 # Create non-root user
 RUN useradd -m -u 1000 ingestor
 
+# State directory for the TTN cursor file (see TTN_CURSOR_FILE).
+RUN mkdir -p /var/lib/ttn-ingest && chown ingestor:ingestor /var/lib/ttn-ingest
+VOLUME ["/var/lib/ttn-ingest"]
+
 # Copy the built binary from builder stage
 COPY --from=builder /build/target/release/ttn-ingest /usr/local/bin/ttn-ingest
 
